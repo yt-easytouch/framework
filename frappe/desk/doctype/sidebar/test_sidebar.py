@@ -781,6 +781,11 @@ class TestSidebarTitleIsRoutable(IntegrationTestCase):
 
 		self.assertEqual(make_sidebar(module, title=title).name, title)
 
+	def test_a_sidebar_may_be_titled_after_its_own_module_in_another_case(self):
+		"""etpos titles the sidebar of module `etpos` as `etPOS`."""
+		title = self.MODULE.upper()
+		self.assertEqual(make_sidebar(self.MODULE, title=title).name, title)
+
 	def test_renaming_a_sidebar_to_its_own_slug_is_allowed(self):
 		"""Changing only the case or the spacing of a title leaves its segment where it was, and
 		it must not collide with itself.
