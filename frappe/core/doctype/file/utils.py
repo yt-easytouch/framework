@@ -5,7 +5,7 @@ import re
 from binascii import Error as BinasciiError
 from io import BytesIO
 from typing import TYPE_CHECKING, Optional
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin
 
 import filetype
 
@@ -83,7 +83,7 @@ def get_extension(
 
 
 def get_local_image(file_url: str) -> tuple["ImageFile", str, str]:
-	from PIL import Image
+	from frappe.utils.image import Image
 
 	if file_url.startswith("/private"):
 		file_url_path = (file_url.lstrip("/"),)
@@ -114,22 +114,40 @@ def get_local_image(file_url: str) -> tuple["ImageFile", str, str]:
 	return image, filename, extn
 
 
+MAX_WEB_IMAGE_REDIRECTS = 5
+
+
 def get_web_image(file_url: str) -> tuple["ImageFile", str, str]:
 	import requests
 	import requests.exceptions
-	from PIL import Image
 
 	from frappe.utils.data import validate_egress_url
+	from frappe.utils.image import Image
 
 	file_url = frappe.utils.get_url(file_url)
 	site_url = frappe.utils.get_url().rstrip("/")
-	if not (file_url == site_url or file_url.startswith(site_url + "/")):
-		try:
-			validate_egress_url(file_url)
-		except ValueError as e:
-			frappe.throw(_("Cannot fetch image from {0}: {1}").format(file_url, str(e)))
 
-	r = requests.get(file_url, stream=True)
+	def validate_external_url(url: str) -> None:
+		if url == site_url or url.startswith(site_url + "/"):
+			return
+		try:
+			validate_egress_url(url)
+		except ValueError as e:
+			frappe.throw(_("Cannot fetch image from {0}: {1}").format(url, str(e)))
+
+	validate_external_url(file_url)
+
+	# Redirects are followed manually so each hop's destination gets the same
+	# validation as the original URL.
+	for _attempt in range(MAX_WEB_IMAGE_REDIRECTS + 1):
+		r = requests.get(file_url, stream=True, allow_redirects=False)
+		if not r.is_redirect:
+			break
+		file_url = urljoin(file_url, r.headers["Location"])
+		validate_external_url(file_url)
+	else:
+		frappe.throw(_("Too many redirects while fetching {0}").format(file_url))
+
 	try:
 		r.raise_for_status()
 	except requests.exceptions.HTTPError as e:
@@ -320,9 +338,9 @@ def update_existing_file_docs(doc: "File") -> None:
 
 def attach_files_to_document(doc: "Document", event) -> None:
 	"""Runs on on_update hook of all documents.
-	Goes through every file linked with the Attach and Attach Image field and attaches
-	the file to the document if not already attached. If no file is found, a new file
-	is created.
+	Goes through every file set or changed in the Attach and Attach Image fields on this save
+	and attaches the file to the document if not already attached. If no file is found, a
+	new file is created.
 	"""
 
 	attach_fields = doc.meta.get("fields", {"fieldtype": ["in", ["Attach", "Attach Image"]]})
@@ -330,6 +348,9 @@ def attach_files_to_document(doc: "Document", event) -> None:
 	for df in attach_fields:
 		# this method runs in on_update hook of all documents
 		# we dont want the update to fail if file cannot be attached for some reason
+		if not doc.has_value_changed(df.fieldname):
+			continue
+
 		value = doc.get(df.fieldname)
 		if not (value or "").startswith(("/files", "/private/files", "http://", "https://")):
 			continue
@@ -352,6 +373,7 @@ def attach_files_to_document(doc: "Document", event) -> None:
 				"attached_to_name": None,
 				"attached_to_doctype": None,
 				"attached_to_field": None,
+				"owner": frappe.session.user,
 			},
 		)
 
@@ -376,9 +398,11 @@ def attach_files_to_document(doc: "Document", event) -> None:
 			attached_to_field=df.fieldname,
 			folder="Home/Attachments",
 		)
+		messages = len(frappe.local.message_log)
 		try:
 			file.insert(ignore_permissions=True)
 		except Exception:
+			del frappe.local.message_log[messages:]
 			doc.log_error("Error Attaching File")
 
 
